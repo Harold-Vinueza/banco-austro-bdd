@@ -1,0 +1,332 @@
+\documentclass[conference]{IEEEtran}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=blue, citecolor=blue}
+\sloppy
+
+\lstset{
+    basicstyle=\ttfamily\scriptsize,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    backgroundcolor=\color{gray!10}
+}
+
+\begin{document}
+
+\title{Fragmentaci\'on Horizontal y Replicaci\'on en Bases de Datos Distribuidas: \\
+Implementaci\'on del Caso Banco del Austro}
+
+\author{
+\IEEEauthorblockN{Harold Nicolas Vinueza S\'anchez}
+\IEEEauthorblockA{Ingenier\'ia en Software, Universidad T\'ecnica Estatal de Quevedo\\
+Aplicaciones Distribuidas --- S\'eptimo Nivel, Paralelo A}
+}
+
+\maketitle
+
+\begin{abstract}
+Este trabajo documenta el dise\~no e implementaci\'on de un prototipo did\'actico de base
+de datos distribuida basado en el caso Banco del Austro, entidad financiera con
+sedes en Cuenca y Quito. Se implementa fragmentaci\'on horizontal sobre las tablas
+\texttt{cuentas} y \texttt{transacciones}, y replicaci\'on completa de la tabla
+\texttt{clientes}, sobre dos motores PostgreSQL 16 independientes coordinados por
+una aplicaci\'on Spring Boot que enruta cada consulta seg\'un el prefijo del n\'umero
+de cuenta. Se verifican emp\'iricamente las propiedades de transparencia de
+fragmentaci\'on, transparencia de ubicaci\'on y autonom\'ia local, esta \'ultima
+mediante una prueba controlada de ca\'ida de nodo.
+\end{abstract}
+
+\begin{IEEEkeywords}
+bases de datos distribuidas, fragmentaci\'on horizontal, replicaci\'on, autonom\'ia
+local, transparencia de ubicaci\'on, PostgreSQL, Spring Boot.
+\end{IEEEkeywords}
+
+\section{Introducci\'on}
+
+Las organizaciones con presencia en m\'ultiples sedes f\'isicas enfrentan un
+compromiso entre la necesidad de que cada oficina opere con baja latencia sobre
+sus datos locales y la necesidad de que la informaci\'on cr\'itica --- como la
+identidad de los clientes --- sea visible de forma consistente en toda la
+organizaci\'on \cite{kleppmann2017}. El caso del Banco del Austro, con oficinas
+en Cuenca, Quito, Guayaquil, Loja y Machala, ilustra este compromiso a escala
+reducida: se implementa un prototipo con dos sedes (Cuenca y Quito) que preserva
+las tres propiedades centrales de una base de datos distribuida --- fragmentaci\'on
+horizontal, transparencia de ubicaci\'on y autonom\'ia local --- descritas
+formalmente por \"Ozsu y Valduriez \cite{ozsu2020}.
+
+El objetivo de este documento es describir el dise\~no de fragmentaci\'on y
+replicaci\'on adoptado, la arquitectura de la implementaci\'on sobre contenedores
+Docker y una aplicaci\'on Spring Boot con m\'ultiples \texttt{DataSource}, y
+presentar la verificaci\'on emp\'irica de las propiedades distribuidas mencionadas,
+incluyendo una prueba de tolerancia a fallos.
+
+\section{Marco Conceptual}
+
+Siguiendo la terminolog\'ia de \"Ozsu y Valduriez \cite{ozsu2020}, una \emph{sede}
+es una ubicaci\'on f\'isica donde reside un motor de base de datos con parte o
+la totalidad del dato de la organizaci\'on; un \emph{nodo} es cada motor
+individual considerado como participante del sistema distribuido. Un
+\emph{fragmento horizontal} es un subconjunto de filas de una tabla l\'ogica
+completa que reside en un nodo espec\'ifico, y debe cumplir tres propiedades:
+completitud (ninguna fila se pierde), reconstructibilidad (la uni\'on de los
+fragmentos recupera la tabla original) y disjunci\'on (ninguna fila reside en
+dos fragmentos simult\'aneamente). Una \emph{r\'eplica}, en cambio, es una copia
+completa de una tabla mantenida en m\'as de un nodo para acelerar lecturas o
+tolerar la ca\'ida de un nodo, a costa de encarecer las escrituras al requerir
+actualizar todas las copias \cite{kleppmann2017}.
+
+\section{Dise\~no de Fragmentaci\'on y Replicaci\'on}
+
+El prototipo reduce el problema real del banco a tres tablas: \texttt{clientes},
+\texttt{cuentas} y \texttt{transacciones}. La Tabla \ref{tab:estrategia} resume
+la estrategia de distribuci\'on adoptada para cada una.
+
+\begin{table}[h]
+\centering
+\caption{Estrategia de distribuci\'on por tabla}
+\label{tab:estrategia}
+\begin{tabular}{|p{1.6cm}|p{1.6cm}|p{3.5cm}|}
+\hline
+\textbf{Tabla} & \textbf{Estrategia} & \textbf{Justificaci\'on} \\
+\hline
+clientes & Replicada & Cualquier oficina debe poder identificar al titular de
+una cuenta, incluso si pertenece a otra sede. \\
+\hline
+cuentas & Fragmentada horizontalmente & Cada cuenta pertenece a exactamente
+una oficina; se consulta casi siempre localmente. \\
+\hline
+transacciones & Fragmentada horizontalmente & Cada movimiento se registra donde
+se origin\'o; los movimientos entre oficinas se difieren a trabajo futuro
+(commit en dos fases). \\
+\hline
+\end{tabular}
+\end{table}
+
+Para que la aplicaci\'on determine la sede de una cuenta sin consultar la base
+de datos, se adopt\'o una convenci\'on de prefijos sobre el n\'umero de cuenta:
+las cuentas de Cuenca inician con \texttt{22} y las de Quito con \texttt{17},
+tomando como referencia los d\'igitos provinciales de la c\'edula ecuatoriana.
+La regla de disjunci\'on de la fragmentaci\'on se garantiza a nivel de motor
+mediante una restricci\'on \texttt{CHECK} en cada nodo:
+
+\begin{lstlisting}[language=SQL]
+-- Nodo Cuenca
+oficina VARCHAR(20) NOT NULL
+    CHECK (oficina = 'CUENCA')
+
+-- Nodo Quito
+oficina VARCHAR(20) NOT NULL
+    CHECK (oficina = 'QUITO')
+\end{lstlisting}
+
+Con esta restricci\'on, cualquier intento de insertar una fila con
+\texttt{oficina = 'QUITO'} en el nodo Cuenca es rechazado autom\'aticamente
+por PostgreSQL, trasladando una regla de dise\~no l\'ogico a una garant\'ia
+f\'isica del motor.
+
+\section{Arquitectura de la Implementaci\'on}
+
+\subsection{Capa de datos: dos motores PostgreSQL en Docker}
+
+Cada sede se implement\'o como un contenedor Docker independiente basado en la
+imagen \texttt{postgres:16-alpine}, con su propio volumen persistente y su
+propio esquema inicializado autom\'aticamente mediante scripts SQL montados en
+\texttt{docker-entrypoint-initdb.d} \cite{docker2024}. Durante la configuraci\'on
+se detect\'o un conflicto entre el puerto est\'andar de PostgreSQL (5432) y una
+instalaci\'on nativa preexistente en el equipo de desarrollo; se resolvi\'o
+remapeando los puertos expuestos a \texttt{5442} (Cuenca) y \texttt{5443}
+(Quito), sin modificar el puerto interno del contenedor. Este ajuste ilustra
+un problema pr\'actico com\'un en el despliegue de sistemas distribuidos
+locales: la coexistencia de m\'ultiples instancias del mismo motor en un
+mismo host.
+
+\subsection{Capa de aplicaci\'on: Spring Boot con m\'ultiples \texttt{DataSource}}
+
+La aplicaci\'on cliente se implement\'o en Java 21 sobre Spring Boot 3.5.16,
+con dos \texttt{DataSource} independientes registrados como \emph{beans}
+calificados (\texttt{@Qualifier("dsCuenca")}, \texttt{@Qualifier("dsQuito")}).
+Este es el punto exacto donde la distribuci\'on se materializa en el c\'odigo
+cliente: un servicio de enrutamiento (\texttt{ConsultaDistribuidaService})
+inspecciona los dos primeros d\'igitos del n\'umero de cuenta recibido y
+selecciona el \texttt{JdbcTemplate} correspondiente antes de ejecutar la
+consulta:
+
+\begin{lstlisting}[language=Java]
+private JdbcTemplate enrutar(String numero) {
+    String prefijo = numero.substring(0, 2);
+    return switch (prefijo) {
+        case "22" -> jdbcCuenca;
+        case "17" -> jdbcQuito;
+        default -> throw new IllegalArgumentException(
+            "Prefijo de oficina no reconocido: " + prefijo);
+    };
+}
+\end{lstlisting}
+
+El controlador REST expone dos endpoints: \texttt{GET /api/banco/saldo/\{numero\}},
+que enruta la consulta a un \'unico nodo, y \texttt{GET /api/banco/clientes},
+que consulta ambos nodos y concatena los resultados, ilustrando la operaci\'on
+de uni\'on sobre fragmentos y r\'eplicas descrita por \"Ozsu y Valduriez
+\cite{ozsu2020}. Ninguno de los dos endpoints revela al cliente HTTP cu\'antos
+motores existen ni d\'onde reside f\'isicamente cada fila, lo que constituye
+una implementaci\'on concreta de \emph{transparencia de fragmentaci\'on} y
+\emph{transparencia de ubicaci\'on}.
+
+\section{Verificaci\'on Emp\'irica}
+
+\subsection{Verificaci\'on de la fragmentaci\'on en el motor}
+
+Mediante pgAdmin 4 se conect\'o de forma independiente a cada nodo
+(\texttt{banco\_cuenca} en el puerto 5442, \texttt{banco\_quito} en el
+puerto 5443) y se ejecut\'o una consulta de uni\'on entre \texttt{cuentas} y
+\texttt{clientes} en cada servidor. El nodo Cuenca devolvi\'o exactamente las
+tres cuentas con prefijo \texttt{22}; el nodo Quito devolvi\'o las tres cuentas
+con prefijo \texttt{17}. La suma de ambos fragmentos (3 + 3 = 6 filas) coincide
+con el total esperado de la relaci\'on l\'ogica completa, verificando
+emp\'iricamente el teorema de reconstrucci\'on sobre fragmentos disjuntos
+\cite{ozsu2020}.
+
+\subsection{Verificaci\'on de la transparencia de ubicaci\'on}
+
+Se realizaron peticiones HTTP directas sobre la aplicaci\'on en ejecuci\'on
+(puerto 8080), obteniendo las siguientes respuestas reales:
+
+\begin{lstlisting}
+GET /api/banco/saldo/2201000001
+{"numero":"2201000001","saldo":15000.00,
+ "oficina":"CUENCA"}
+
+GET /api/banco/saldo/1701000001
+{"numero":"1701000001","saldo":8000.00,
+ "oficina":"QUITO"}
+
+GET /api/banco/clientes
+[6 registros: 3 de Cuenca + 3 de Quito]
+\end{lstlisting}
+
+Las tres peticiones se resolvieron correctamente sin que el cliente HTTP
+especificara en ning\'un momento cu\'al motor f\'isico deb\'ia consultarse,
+confirmando que el enrutador interno de la aplicaci\'on cumple su funci\'on
+de forma transparente.
+
+\section{Prueba de Tolerancia a Fallos}
+
+Para verificar la propiedad de autonom\'ia local se detuvo deliberadamente el
+contenedor \texttt{banco-quito} mediante \texttt{docker stop} mientras la
+aplicaci\'on permanec\'ia en ejecuci\'on, y se repitieron las tres peticiones
+anteriores. El resultado observado fue el siguiente:
+
+\begin{itemize}
+    \item La consulta sobre la cuenta \texttt{2201000001} (nodo Cuenca) se
+    resolvi\'o con normalidad, con la misma respuesta que antes de la ca\'ida.
+    \item La consulta sobre la cuenta \texttt{1701000001} (nodo Quito) no
+    devolvi\'o respuesta ni error inmediato: la conexi\'on qued\'o en espera
+    hasta ser interrumpida manualmente, comportamiento consistente con el
+    agotamiento del tiempo de espera por defecto del pool de conexiones
+    HikariCP, dado que la aplicaci\'on no implementa un patr\'on de tipo
+    \emph{circuit breaker} \cite{newman2021}.
+    \item La consulta \texttt{/api/banco/clientes}, al depender de ambos
+    nodos para la operaci\'on de uni\'on, present\'o el mismo comportamiento
+    de espera prolongada que la consulta a Quito.
+\end{itemize}
+
+Al reactivar el contenedor con \texttt{docker start}, las tres peticiones
+volvieron a resolverse con normalidad sin necesidad de reiniciar la
+aplicaci\'on Java. Este resultado confirma emp\'iricamente que el nodo Cuenca
+mantuvo disponibilidad total sobre sus propios datos durante la ca\'ida de
+Quito --- es decir, \emph{autonom\'ia local} --- si bien evidencia tambi\'en
+una limitaci\'on real del prototipo: sin un mecanismo de \emph{circuit
+breaker}, la indisponibilidad de un nodo se propaga como una espera larga
+incluso hacia operaciones que, en principio, no lo necesitan \cite{newman2021}.
+Este comportamiento es consistente con una clasificaci\'on CP (consistencia
+y tolerancia a particiones) seg\'un el teorema CAP \cite{brewer2000}
+\cite{gilbert2002}, matizada por el modelo PACELC \cite{abadi2012}: ante la
+p\'erdida de un nodo, el sistema prioriz\'o no devolver datos potencialmente
+inconsistentes sobre Quito antes que degradar autom\'aticamente el servicio.
+
+\section{Aplicabilidad al Proyecto Integrador}
+
+El proyecto integrador SCLI (Sistema de Control de Laboratorio Inform\'atico),
+compuesto por m\'odulos NestJS, una base de datos PostgreSQL compartida y un
+API Gateway con autenticaci\'on JWT y control de acceso basado en roles,
+podr\'ia beneficiarse de un esquema de fragmentaci\'on an\'alogo si el sistema
+llegara a operar sobre m\'ultiples laboratorios f\'isicos distribuidos en
+distintas sedes de la instituci\'on: los registros de uso y reservas de cada
+laboratorio se fragmentar\'ian horizontalmente por sede, mientras que el
+cat\'alogo de usuarios permanecer\'ia replicado para permitir autenticaci\'on
+cruzada entre sedes, siguiendo el mismo principio aplicado a las tablas
+\texttt{cuentas} y \texttt{clientes} en este prototipo.
+
+\section{Conclusiones}
+
+El prototipo implementado evidencia de forma pr\'actica las tres propiedades
+centrales de una base de datos distribuida: fragmentaci\'on horizontal
+completa, reconstructible y disjunta --- garantizada a nivel de motor mediante
+restricciones \texttt{CHECK}--- replicaci\'on de datos compartidos, y
+autonom\'ia local verificada emp\'iricamente mediante una prueba de ca\'ida de
+nodo controlada. La principal limitaci\'on identificada es la ausencia de un
+patr\'on de \emph{circuit breaker}, que en su estado actual provoca que la
+ca\'ida de un nodo se propague como una espera prolongada hacia operaciones de
+uni\'on entre fragmentos. Trabajo futuro incluye la incorporaci\'on de dicho
+patr\'on, la implementaci\'on de \emph{commit} en dos fases para transferencias
+entre sedes y la extensi\'on del esquema a un tercer nodo (Guayaquil).
+
+\section*{Declaraci\'on de Uso de Inteligencia Artificial}
+Se utiliz\'o el asistente de inteligencia artificial Claude (Anthropic) como
+apoyo durante la implementaci\'on guiada paso a paso del c\'odigo (configuraci\'on
+de Docker, clases Java de Spring Boot) y en la redacci\'on y estructuraci\'on
+de este documento. Todos los resultados emp\'iricos reportados corresponden a
+ejecuciones reales realizadas por el autor sobre su propio ambiente de
+desarrollo.
+
+\begin{thebibliography}{00}
+
+\bibitem{ozsu2020} M. T. \"Ozsu and P. Valduriez, \emph{Principles of
+Distributed Database Systems}, 4th ed. Cham, Switzerland: Springer
+International Publishing, 2020.
+
+\bibitem{kleppmann2017} M. Kleppmann, \emph{Designing Data-Intensive
+Applications: The Big Ideas Behind Reliable, Scalable, and Maintainable
+Systems}, 1st ed. Sebastopol, CA, USA: O'Reilly Media, 2017.
+
+\bibitem{newman2021} S. Newman, \emph{Building Microservices: Designing
+Fine-Grained Systems}, 2nd ed. Sebastopol, CA, USA: O'Reilly Media, 2021.
+
+\bibitem{brewer2000} E. A. Brewer, ``Towards robust distributed systems
+(abstract),'' in \emph{Proc. 19th Annu. ACM Symp. Principles of Distributed
+Computing (PODC '00)}, Portland, OR, USA, 2000, p. 7, doi:
+10.1145/343477.343502.
+
+\bibitem{gilbert2002} S. Gilbert and N. Lynch, ``Brewer's conjecture and the
+feasibility of consistent, available, partition-tolerant web services,''
+\emph{ACM SIGACT News}, vol. 33, no. 2, pp. 51--59, Jun. 2002, doi:
+10.1145/564585.564601.
+
+\bibitem{abadi2012} D. J. Abadi, ``Consistency tradeoffs in modern
+distributed database system design: CAP is only part of the story,''
+\emph{Computer}, vol. 45, no. 2, pp. 37--42, Feb. 2012, doi:
+10.1109/MC.2012.33.
+
+\bibitem{docker2024} Docker, Inc., ``Docker Compose specification.''
+[En l\'inea]. Disponible: \url{https://docs.docker.com/compose/}.
+[Accedido: 9-jul-2026].
+
+\bibitem{spring2024} VMware Tanzu / Broadcom, ``Spring Boot Reference
+Documentation.'' [En l\'inea]. Disponible:
+\url{https://spring.io/projects/spring-boot}. [Accedido: 9-jul-2026].
+
+\bibitem{postgres2024} PostgreSQL Global Development Group, ``PostgreSQL 16
+Documentation.'' [En l\'inea]. Disponible:
+\url{https://www.postgresql.org/docs/16/}. [Accedido: 9-jul-2026].
+
+\end{thebibliography}
+
+\end{document}
