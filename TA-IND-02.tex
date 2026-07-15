@@ -1,0 +1,482 @@
+\documentclass[12pt,letterpaper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,fit,backgrounds}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{titlesec}
+
+\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=blue, citecolor=blue}
+\sloppy
+\onehalfspacing
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\begin{document}
+
+% ============================================================
+% PORTADA (Seccion 1 de la estructura obligatoria - no cuenta
+% para el minimo de 5 paginas de contenido)
+% ============================================================
+\begin{titlepage}
+\centering
+\vspace*{1.5cm}
+
+{\large UNIVERSIDAD T\'ECNICA ESTATAL DE QUEVEDO\par}
+{\normalsize Facultad de Ciencias de la Computaci\'on\par}
+{\normalsize Carrera de Ingenier\'ia de Software\par}
+\vspace{0.3cm}
+{\normalsize Aplicaciones Distribuidas (ISR-701) --- Unidad 3\par}
+
+\vspace{2cm}
+{\Large\bfseries An\'alisis Cr\'itico del Modelo de Consistencia \\
+y Replicaci\'on en el Sistema de Control de \\
+Laboratorios Inform\'aticos (SCLI)\par}
+
+\vspace{0.5cm}
+{\normalsize CockroachDB, Consenso Raft y Coordinaci\'on entre Microservicios\par}
+
+\vspace{2cm}
+{\normalsize\bfseries C\'odigo: TA-IND-02\par}
+{\normalsize Trabajo Aut\'onomo Individual --- Sumativo\par}
+
+\vspace{1.5cm}
+{\normalsize\bfseries Estudiante:\par}
+{\normalsize Harold Nicol\'as Vinueza S\'anchez\par}
+
+\vspace{0.8cm}
+{\normalsize\bfseries Equipo PFC:\par}
+{\normalsize FUVV --- Sistema de Control de Laboratorios Inform\'aticos (SCLI)\par}
+
+\vspace{0.8cm}
+{\normalsize\bfseries Docente:\par}
+{\normalsize Ph.D. Gleiston C. Guerrero-Ulloa\par}
+
+\vspace{1.5cm}
+{\normalsize Per\'iodo Acad\'emico 2026--2027\par}
+{\normalsize Quevedo, Ecuador --- Julio de 2026\par}
+
+\vfill
+\end{titlepage}
+
+% ============================================================
+% RESUMEN (Seccion 2)
+% ============================================================
+\section*{Resumen}
+Este informe analiza cr\'iticamente el modelo de consistencia y replicaci\'on
+implementado en el Sistema de Control de Laboratorios Inform\'aticos (SCLI),
+proyecto fin de curso del equipo FUVV. SCLI adopta una arquitectura de
+microservicios con base de datos dedicada por servicio sobre CockroachDB,
+lo que produce dos capas de consistencia distintas: una capa
+\emph{intra-servicio} fuerte, garantizada por el consenso Raft de
+CockroachDB con aislamiento serializable, y una capa \emph{inter-servicio}
+sin garant\'ias formales, sostenida \'unicamente por llamadas REST
+s\'incronas. Se caracteriza el modelo real implementado, se eval\'uan dos
+alternativas de consistencia y replicaci\'on frente al modelo actual
+mediante criterios t\'ecnicos expl\'icitos, y se responde de forma razonada
+si el modelo elegido es \'optimo para el dominio de reserva y monitoreo de
+laboratorios. Se concluye que la fortaleza de consistencia intra-servicio
+est\'a bien justificada, pero la ausencia de un mecanismo expl\'icito de
+coordinaci\'on entre servicios constituye una limitaci\'on real que debe
+resolverse antes de completar la integraci\'on del m\'odulo de reservas.
+
+\vspace{0.5cm}
+
+% ============================================================
+% INTRODUCCION (Seccion 3)
+% ============================================================
+\section{Introducci\'on}
+
+El Sistema de Control de Laboratorios Inform\'aticos (SCLI) es el proyecto
+fin de curso (PFC) del equipo FUVV, correspondiente al dominio de referencia
+\emph{Laboratorios Inform\'aticos} definido para el per\'iodo. El sistema
+migra un monolito de gesti\'on de laboratorios hacia una arquitectura de
+microservicios (\texttt{auth-service}, \texttt{usuarios-service},
+\texttt{academico-laboratorios-service} y
+\texttt{reservas-solicitudes-service}), cada uno con su propia base de
+datos CockroachDB, orquestados con Docker Compose y comunicados mediante
+REST interno protegido con una clave compartida.
+
+Esta arquitectura de \emph{base de datos por servicio} plantea una pregunta
+que no es meramente acad\'emica sino directamente aplicable al estado
+actual del c\'odigo del equipo: \textbf{\textquestiondown es el modelo de
+consistencia elegido el \'optimo para el dominio del sistema?} El presente
+informe responde a esa pregunta caracterizando el modelo realmente
+implementado --- tanto dentro de cada servicio como entre servicios ---
+contrast\'andolo con al menos dos alternativas de dise\~no y discutiendo sus
+compromisos a la luz del teorema CAP y del modelo PACELC.
+
+% ============================================================
+% MARCO TEORICO (Seccion 4)
+% ============================================================
+\section{Marco Te\'orico}
+
+\subsection{Espectro de modelos de consistencia}
+
+La consistencia de r\'eplicas no es una propiedad binaria sino un espectro
+ordenado por fuerza sem\'antica \cite{viotti2016}. En el extremo m\'as
+fuerte, la \textbf{linealizabilidad} (o consistencia fuerte) garantiza que
+toda operaci\'on parece ejecutarse instant\'aneamente en un punto \'unico
+entre su inicio y su fin, de modo que cualquier lector observa siempre el
+\'ultimo valor escrito. La \textbf{consistencia secuencial} relaja el
+requisito temporal pero preserva un orden global \'unico compartido por
+todos los procesos. La \textbf{consistencia causal} solo exige preservar el
+orden entre operaciones causalmente relacionadas, permitiendo reordenar
+operaciones concurrentes independientes. La \textbf{consistencia de lectura
+de los propios cambios} (\emph{read-your-writes}) garantiza \'unicamente
+que un proceso vea sus propias escrituras previas. En el extremo m\'as
+d\'ebil, la \textbf{consistencia eventual} solo promete que, en ausencia de
+nuevas escrituras, todas las r\'eplicas converger\'an eventualmente al
+mismo estado. Un modelo m\'as fuerte impone mayor coordinaci\'on entre
+nodos --- y por tanto mayor latencia --- mientras que uno m\'as d\'ebil
+admite mayor disponibilidad a costa de exponer estados transitoriamente
+divergentes a la aplicaci\'on \cite{kleppmann2017}.
+
+\subsection{Teoremas de compromiso: CAP y PACELC}
+
+El teorema CAP, formalizado por Gilbert y Lynch a partir de la conjetura de
+Brewer, establece que ante una partici\'on de red un sistema distribuido no
+puede garantizar simult\'aneamente consistencia y disponibilidad
+\cite{gilbert2002}. Dado que las particiones son inevitables en cualquier
+red real, la decisi\'on de dise\~no efectiva es CP (priorizar consistencia)
+o AP (priorizar disponibilidad) ante ese escenario de falla. Abadi
+extiende esta lectura con el modelo PACELC: incluso \emph{sin} partici\'on,
+un sistema distribuido debe resolver un compromiso entre latencia y
+consistencia en su operaci\'on normal (\emph{Else}), de modo que un sistema
+se clasifica completamente como PC/EC, PA/EL, o combinaciones intermedias
+seg\'un su configuraci\'on \cite{abadi2012}.
+
+\subsection{Estrategias de replicaci\'on y consenso}
+
+Las estrategias de replicaci\'on se distinguen por qui\'en acepta las
+escrituras. En la replicaci\'on \textbf{primario-secundario} (o
+\emph{leader-follower}), una \'unica r\'eplica designada acepta escrituras
+y las propaga a las dem\'as, que solo sirven lecturas; ofrece consistencia
+fuerte natural pero convierte al primario en un cuello de botella. En la
+replicaci\'on \textbf{multi-primario}, varias r\'eplicas aceptan escrituras
+concurrentes, mejorando la disponibilidad de escritura a costa de requerir
+pol\'iticas de resoluci\'on de conflictos. En la replicaci\'on
+\textbf{sin l\'ider} (\emph{leaderless}) basada en \emph{quorum}, un
+cliente escribe en paralelo sobre varios nodos y la operaci\'on se
+considera exitosa cuando W r\'eplicas confirman, garantiz\'andose lecturas
+consistentes si W + R > N \cite{tanenbaum2017}. Los algoritmos de consenso
+modernos, en particular Raft, sustituyen a los protocolos de bloqueo como
+el commit en dos fases al replicar un registro de decisiones por mayor\'ia
+sin asumir sincron\'ia de red, y son la base de sistemas de producci\'on
+como etcd y CockroachDB \cite{ongaro2014}.
+
+\subsection{Sistemas de referencia: los dos extremos del espectro}
+
+Dynamo, el almacenamiento clave-valor de Amazon, prioriza la disponibilidad
+mediante replicaci\'on sin l\'ider, \emph{quorum} configurable y
+consistencia eventual con resoluci\'on de conflictos por vectores de
+versi\'on, aceptando que distintas r\'eplicas puedan divergir
+temporalmente a cambio de nunca rechazar una escritura \cite{decandia2007}.
+En el extremo opuesto, Google Spanner ofrece consistencia externa
+(transacciones globalmente serializables) apoy\'andose en TrueTime, una API
+de tiempo con incertidumbre acotada mediante relojes at\'omicos y GPS, lo
+que le permite comportarse como CP/EC incluso a escala planetaria
+\cite{corbett2013}. CockroachDB, la base de datos utilizada en SCLI, se
+sit\'ua conceptualmente junto a Spanner: es una base de datos relacional
+distribuida que fragmenta autom\'aticamente los datos en \emph{ranges}
+replicados por consenso Raft, con aislamiento serializable estricto por
+defecto, clasificada como PC/EC bajo PACELC.
+
+% ============================================================
+% ANALISIS DEL PFC (Seccion 5) - NUCLEO D2
+% ============================================================
+\section{An\'alisis del Modelo de Consistencia de SCLI}
+\label{sec:analisis}
+
+\subsection{Arquitectura de datos: base de datos por servicio}
+
+SCLI implementa el patr\'on \emph{database per service}: cada
+microservicio --- \texttt{auth-service}, \texttt{usuarios-service} y
+\texttt{academico-laboratorios-service} (este \'ultimo desarrollado por el
+autor de este informe) --- posee su propia instancia CockroachDB aislada,
+sin acceso directo a los datos de los dem\'as. La comunicaci\'on entre
+servicios ocurre exclusivamente a trav\'es de REST interno protegido con
+el encabezado \texttt{X-Internal-Api-Key}. La Figura~\ref{fig:topologia}
+ilustra esta topolog\'ia, incluyendo el cuarto servicio,
+\texttt{reservas-solicitudes-service}, a\'un incompleto.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.9cm and 1.1cm,
+    service/.style={rectangle, draw, rounded corners, minimum width=2.9cm,
+        minimum height=1cm, align=center, fill=blue!8, font=\scriptsize},
+    servicepend/.style={rectangle, draw, dashed, rounded corners,
+        minimum width=2.9cm, minimum height=1cm, align=center,
+        fill=gray!10, font=\scriptsize},
+    db/.style={cylinder, draw, shape border rotate=90, aspect=0.25,
+        minimum width=1.7cm, minimum height=0.9cm, align=center,
+        fill=orange!12, font=\tiny},
+    front/.style={rectangle, draw, rounded corners, minimum width=2.9cm,
+        minimum height=0.9cm, align=center, fill=green!10, font=\scriptsize}
+]
+
+\node[front] (front) {SCLI Front\\(Vue 3)};
+
+\node[service, below=of front, xshift=-4.6cm] (auth) {auth-service\\:8081};
+\node[service, below=of front, xshift=-1.5cm] (usu) {usuarios-service\\:8082};
+\node[service, below=of front, xshift=1.5cm] (aca) {academico-labs-service\\:8083};
+\node[servicepend, below=of front, xshift=4.6cm] (res) {reservas-solicitudes\\:8084 (incompleto)};
+
+\node[db, below=0.55cm of auth] (dbauth) {CRDB\\v26.2.0\\Raft};
+\node[db, below=0.55cm of usu] (dbusu) {CRDB\\v24.3.5 $\ast$\\Raft};
+\node[db, below=0.55cm of aca] (dbaca) {CRDB\\v26.2.0\\Raft};
+
+\draw[-{Latex[length=2mm]}] (front) -- (auth);
+\draw[-{Latex[length=2mm]}] (front) -- (usu);
+\draw[-{Latex[length=2mm]}] (front) -- (aca);
+\draw[-{Latex[length=2mm]}, dashed] (front) -- (res);
+
+\draw[-{Latex[length=2mm]}] (auth) -- (dbauth);
+\draw[-{Latex[length=2mm]}] (usu) -- (dbusu);
+\draw[-{Latex[length=2mm]}] (aca) -- (dbaca);
+
+\draw[-{Latex[length=2mm]}, dashed, bend left=15]
+    (res.north west) to node[above, font=\tiny] {REST s\'incrono} (usu.east);
+\draw[-{Latex[length=2mm]}, dashed, bend right=15]
+    (res.north) to node[below, font=\tiny] {REST s\'incrono} (aca.east);
+
+\end{tikzpicture}
+\caption{Topolog\'ia de SCLI: consistencia fuerte intra-servicio v\'ia
+CockroachDB/Raft (l\'inea continua) frente a coordinaci\'on inter-servicio
+sin garant\'ias formales v\'ia REST s\'incrono (l\'inea discontinua).
+$\ast$ La versi\'on divergente de CockroachDB en \texttt{usuarios-service}
+es un riesgo real de heterogeneidad documentado en el repositorio del
+equipo.}
+\label{fig:topologia}
+\end{figure}
+
+\subsection{Capa intra-servicio: consistencia fuerte heredada de CockroachDB}
+
+El modelo de consistencia \emph{dentro} de cada servicio no fue dise\~nado
+expl\'icitamente por el equipo, sino heredado de la elecci\'on tecnol\'ogica
+de CockroachDB. Cada base de datos fragmenta autom\'aticamente sus tablas
+en \emph{ranges} de aproximadamente 64~MB, cada uno replicado mediante
+consenso Raft entre los nodos del cl\'uster, con aislamiento serializable
+estricto por defecto. Esto ubica a cada instancia CockroachDB de SCLI como
+PC/EC bajo PACELC: ante una partici\'on, el sistema prioriza no devolver
+datos potencialmente obsoletos (C sobre A); en operaci\'on normal, el
+consenso s\'incrono impone mayor latencia de escritura a cambio de
+consistencia estricta (C sobre L) \cite{abadi2012}.
+
+Un hallazgo t\'ecnico propio refuerza esta caracterizaci\'on: la
+integraci\'on de Flyway con CockroachDB v26.2 en
+\texttt{academico-laboratorios-service} requiri\'o agregar el par\'ametro
+JDBC \texttt{options=-c\%20allow\_unsafe\_internals\%3Dtrue}, evidencia
+directa de que los cambios de esquema deben coordinarse con las garant\'ias
+internas del motor y no pueden tratarse como operaciones triviales en un
+sistema con consenso distribuido. La \textbf{divergencia de versi\'on}
+entre \texttt{usuarios-service} (CockroachDB v24.3.5) y el resto de
+servicios (v26.2.0), visible en la Figura~\ref{fig:topologia}, es adem\'as
+un riesgo concreto: aunque cada base opera de forma aislada y esto no
+compromete la consistencia \emph{interna} de ninguna de ellas, s\'i
+introduce heterogeneidad de comportamiento (posibles diferencias en
+optimizador de consultas o semántica de \texttt{ALTER TABLE}) que
+complicar\'ia una futura federaci\'on de esquemas entre servicios.
+
+\subsection{Capa inter-servicio: coordinaci\'on sin garant\'ias formales}
+
+A diferencia de la capa intra-servicio, la comunicaci\'on \emph{entre}
+microservicios de SCLI no implementa ning\'un modelo de consistencia
+expl\'icito. Los clientes REST de \texttt{reservas-solicitudes-service}
+(\texttt{AcademicoLaboratoriosClient}, \texttt{UsuariosClient}, construidos
+sobre \texttt{RestClient} de Spring) realizan llamadas s\'incronas de
+solicitud-respuesta sin coordinaci\'on transaccional, sin patr\'on de
+compensaci\'on y sin cola de mensajes intermedia. El \'unico mecanismo de
+consistencia a nivel de aplicaci\'on documentado por el equipo es
+\textbf{local} a \texttt{reservas-solicitudes-service}: concurrencia
+optimista mediante un campo \texttt{version} sobre las entidades
+\texttt{SolicitudReserva} y \texttt{Reserva}, e idempotencia en las
+operaciones de iniciar, finalizar y cancelar una reserva, seg\'un el
+documento de dise\~no \texttt{02-maquina-estados.md} del propio equipo. La
+coordinaci\'on entre la aprobaci\'on de una solicitud y la creaci\'on de su
+reserva correspondiente se resuelve \'unicamente dentro de una transacci\'on
+local a ese servicio; no existe ning\'un mecanismo an\'alogo para
+coordinar, por ejemplo, una eventual inconsistencia si
+\texttt{academico-laboratorios-service} cambia el estado de un laboratorio
+mientras \texttt{reservas-solicitudes-service} procesa una reserva sobre
+\'el.
+
+En t\'erminos de PACELC, esta capa no puede clasificarse formalmente
+porque no fue dise\~nada como una decisi\'on consciente: es, de facto, un
+acoplamiento s\'incrono fr\'agil sin las garant\'ias de un modelo PC (no
+hay consenso ni transacci\'on distribuida) ni la resiliencia expl\'icita de
+un modelo AP (no hay degradaci\'on controlada ni cola de reintento ante
+fallo de un servicio dependiente).
+
+% ============================================================
+% EVALUACION DE ALTERNATIVAS (Seccion 6) - NUCLEO D3
+% ============================================================
+\section{Evaluaci\'on de Alternativas}
+
+Se contrasta el modelo actual (REST s\'incrono sin coordinaci\'on expl\'icita
+entre servicios, consistencia fuerte solo intra-servicio) con dos
+alternativas de dise\~no aplicables al dominio de SCLI.
+
+\textbf{Alternativa A --- Propagaci\'on por eventos (\emph{outbox} +
+consistencia eventual inter-servicio).} Cada servicio publica eventos de
+dominio (por ejemplo, \texttt{LaboratorioActualizado},
+\texttt{PerfilModificado}) mediante el patr\'on \emph{transactional
+outbox}, consumidos as\'incronamente por los servicios interesados para
+mantener copias locales de solo lectura. La consistencia intra-servicio se
+mantiene fuerte (CockroachDB/Raft); la consistencia inter-servicio pasa a
+ser expl\'icitamente eventual.
+
+\textbf{Alternativa B --- Orquestaci\'on tipo Saga con compensaci\'on.}
+Para operaciones cr\'iticas que cruzan servicios --- como la aprobaci\'on
+de una solicitud que depende de validar disponibilidad en
+\texttt{academico-laboratorios-service} y el rol del usuario en
+\texttt{usuarios-service} --- se introduce un orquestador de Saga que
+ejecuta pasos remotos y, ante un fallo parcial, dispara acciones
+compensatorias expl\'icitas en lugar de asumir at\'omicidad inexistente.
+
+La Tabla~\ref{tab:alternativas} compara ambas alternativas con el modelo
+actual seg\'un cinco criterios t\'ecnicos.
+
+\begin{table}[h]
+\centering
+\caption{Comparaci\'on del modelo actual frente a dos alternativas de
+consistencia y replicaci\'on inter-servicio}
+\label{tab:alternativas}
+\small
+\begin{tabular}{@{}p{3.1cm}p{3.1cm}p{3.1cm}p{3.1cm}@{}}
+\toprule
+\textbf{Criterio} & \textbf{Actual (REST s\'incrono)} & \textbf{A: Eventos} & \textbf{B: Saga} \\
+\midrule
+Consistencia inter-servicio & Indefinida & Eventual & Fuerte por operaci\'on \\
+Disponibilidad ante fallo remoto & Baja (falla en cascada) & Alta & Media \\
+Latencia percibida & Baja (si todo responde) & Muy baja (lectura local) & Media--alta \\
+Tolerancia a partici\'on & No dise\~nada & Alta & Media \\
+Complejidad de implementaci\'on & Baja & Media & Alta \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Postura cr\'itica: \textquestiondown es el modelo actual \'optimo?}
+
+La respuesta es \textbf{parcialmente s\'i, parcialmente no}, y depende de
+separar las dos capas identificadas en la Secci\'on~\ref{sec:analisis}.
+
+\textbf{La capa intra-servicio s\'i es una elecci\'on \'optima o cercana a
+\'optima} para el dominio de laboratorios inform\'aticos. Datos como el
+estado de un laboratorio o la asignaci\'on de un equipo requieren evitar
+condiciones de sobre-asignaci\'on --- an\'alogas al riesgo de sobregiro en
+un dominio bancario --- por lo que la consistencia fuerte que CockroachDB
+ofrece por defecto, v\'ia Raft y aislamiento serializable, est\'a
+justificada por el dominio y no por inercia tecnol\'ogica.
+
+\textbf{La capa inter-servicio, en cambio, no es \'optima en su estado
+actual}, no porque el REST s\'incrono sea inv\'alido en general, sino
+porque el equipo no tom\'o una decisi\'on consciente sobre qu\'e modelo de
+consistencia aplicar entre servicios: el acoplamiento s\'incrono actual
+combina las desventajas de un modelo fuerte (latencia acumulada, fallo en
+cascada) sin ofrecer ninguna de sus garant\'ias reales (no hay
+at\'omicidad cross-service). Esta limitaci\'on se agrava porque
+\texttt{reservas-solicitudes-service} --- el componente que m\'as depende
+de esta coordinaci\'on --- ni siquiera compila actualmente, al faltar las
+implementaciones de \texttt{ReservaService} y
+\texttt{SolicitudReservaService}; el equipo est\'a a tiempo de decidir el
+modelo de coordinaci\'on \emph{antes} de terminar de conectar esas piezas,
+en lugar de despu\'es.
+
+Como mitigaci\'on concreta, se recomienda adoptar la \textbf{Alternativa
+B (Saga con compensaci\'on)} espec\'ificamente para el flujo cr\'itico de
+aprobaci\'on de solicitudes --- donde una inconsistencia s\'i tendr\'ia
+impacto operativo real --- y reservar la \textbf{Alternativa A (eventos)}
+para la propagaci\'on de datos de solo lectura de bajo riesgo, como copias
+locales del perfil de usuario o del estado general de un laboratorio, que
+toleran consistencia eventual sin afectar la integridad del dominio.
+
+% ============================================================
+% CONCLUSIONES (Seccion 7)
+% ============================================================
+\section{Conclusiones}
+
+El modelo de consistencia de SCLI no es una decisi\'on \'unica sino dos
+decisiones superpuestas: una fuerte y bien justificada, heredada de
+CockroachDB dentro de cada microservicio; y otra, impl\'icita y no
+dise\~nada, en la coordinaci\'on entre servicios v\'ia REST s\'incrono. El
+teorema CAP y el modelo PACELC permiten clasificar con precisi\'on la
+primera capa (PC/EC) pero exponen la ausencia de una clasificaci\'on
+equivalente para la segunda, que es precisamente el hallazgo cr\'itico de
+este an\'alisis. Se recomienda que el equipo adopte expl\'icitamente un
+patr\'on de coordinaci\'on --- Saga para operaciones cr\'iticas, eventos
+para propagaci\'on de solo lectura --- antes de completar la
+implementaci\'on de \texttt{reservas-solicitudes-service}, transformando
+una limitaci\'on arquitect\'onica actual en una decisi\'on de dise\~no
+consciente y defendible.
+
+% ============================================================
+% DECLARACION DE USO DE IA (Seccion 8)
+% ============================================================
+\section*{Declaraci\'on de Uso de Inteligencia Artificial}
+
+Se utiliz\'o el asistente de inteligencia artificial Claude (Anthropic)
+como apoyo en: (i) la estructuraci\'on del documento conforme a los
+requisitos del TA-IND-02; (ii) la redacci\'on y organizaci\'on de las
+secciones de marco te\'orico, an\'alisis y evaluaci\'on de alternativas a
+partir de la informaci\'on real del repositorio del PFC proporcionada por
+el autor; (iii) la elaboraci\'on del diagrama de topolog\'ia (Figura~1) en
+c\'odigo TikZ. La caracterizaci\'on t\'ecnica del sistema SCLI, la
+verificaci\'on de las referencias citadas y la postura cr\'itica final
+fueron revisadas y validadas por el autor.
+
+% ============================================================
+% REFERENCIAS (Seccion 9)
+% ============================================================
+\begin{thebibliography}{00}
+
+\bibitem{abadi2012} D. J. Abadi, ``Consistency tradeoffs in modern
+distributed database system design: CAP is only part of the story,''
+\emph{IEEE Computer}, vol. 45, no. 2, pp. 37--42, Feb. 2012, doi:
+10.1109/MC.2012.33.
+
+\bibitem{corbett2013} J. C. Corbett et al., ``Spanner: Google's globally
+distributed database,'' \emph{ACM Transactions on Computer Systems},
+vol. 31, no. 3, art. no. 8, pp. 1--22, 2013, doi: 10.1145/2491245.
+
+\bibitem{decandia2007} G. DeCandia et al., ``Dynamo: Amazon's highly
+available key-value store,'' in \emph{Proc. 21st ACM SIGOPS Symp.
+Operating Systems Principles (SOSP '07)}, 2007, pp. 205--220, doi:
+10.1145/1294261.1294281.
+
+\bibitem{gilbert2002} S. Gilbert and N. Lynch, ``Brewer's conjecture and
+the feasibility of consistent, available, partition-tolerant web
+services,'' \emph{ACM SIGACT News}, vol. 33, no. 2, pp. 51--59, Jun. 2002,
+doi: 10.1145/564585.564601.
+
+\bibitem{viotti2016} P. Viotti and M. Vukoli\'c, ``Consistency in
+non-transactional distributed storage systems,'' \emph{ACM Computing
+Surveys}, vol. 49, no. 1, art. no. 19, pp. 1--34, 2016, doi:
+10.1145/2926965.
+
+\bibitem{ongaro2014} D. Ongaro and J. Ousterhout, ``In search of an
+understandable consensus algorithm,'' in \emph{Proc. 2014 USENIX Annual
+Technical Conference (USENIX ATC '14)}, Philadelphia, PA, USA, Jun. 2014,
+pp. 305--319, isbn: 978-1-931971-10-2.
+
+\bibitem{tanenbaum2017} M. van Steen and A. S. Tanenbaum,
+\emph{Distributed Systems}, 3rd ed. CreateSpace Independent Publishing
+Platform, 2017, isbn: 978-1543057386.
+
+\bibitem{kleppmann2017} M. Kleppmann, \emph{Designing Data-Intensive
+Applications: The Big Ideas Behind Reliable, Scalable, and Maintainable
+Systems}, 1st ed. Sebastopol, CA, USA: O'Reilly Media, 2017, isbn:
+978-1-4493-7332-0.
+
+\end{thebibliography}
+
+\end{document}
